@@ -3,13 +3,15 @@
 #  à partir du boot volume existant, jusqu'à ce que de la capacité
 #  se libère à Paris.
 #
-#  - Un essai toutes les 5 min environ (GitHub peut retarder les crons).
-#  - En cas de succès : ouvre une issue (notification e-mail) puis
-#    désactive ce workflow.
-#  - Si le boot volume est déjà attaché (VM déjà créée ailleurs) :
-#    désactive simplement le workflow.
-#  - Erreur définitive (auth, limites, paramètre invalide) : ouvre une
-#    issue et désactive le workflow, pour éviter une rafale d'e-mails.
+#  Fonctionnement :
+#  - Un run tourne en boucle ~5 h 30 (un essai toutes les 90 s),
+#    puis se relance lui-même (workflow_dispatch) : la chaîne ne
+#    dépend pas du planificateur GitHub, souvent en retard.
+#  - Un cron horaire sert seulement de filet de sécurité si la
+#    chaîne venait à se casser.
+#  - Succès : ouvre une issue (e-mail) puis désactive le workflow.
+#  - Boot volume déjà attaché (VM créée ailleurs) : désactive.
+#  - Erreur définitive (auth, limites, paramètre) : issue + désactive.
 #
 #  Secrets requis (Settings > Secrets and variables > Actions) :
 #    OCI_USER, OCI_TENANCY, OCI_FINGERPRINT, OCI_KEY,
@@ -19,17 +21,17 @@
 name: Relance VM A1
 
 on:
+  workflow_dispatch: {}      # lancement manuel ET auto-relance
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch: {}   # bouton "Run workflow" pour lancer à la main
+    - cron: "17 * * * *"     # filet de sécurité, une fois par heure
 
-# Droits du jeton GitHub : désactiver le workflow et créer une issue
+# Droits du jeton GitHub : relancer/désactiver le workflow, créer une issue
 permissions:
   actions: write
   issues: write
   contents: read
 
-# Jamais deux essais en parallèle
+# Un seul run à la fois ; un run supplémentaire attend son tour
 concurrency:
   group: relance-vm-a1
   cancel-in-progress: false
@@ -37,7 +39,7 @@ concurrency:
 jobs:
   launch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 350     # limite GitHub : 360 min par job
     env:
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
       REGION: "eu-paris-1"
@@ -46,6 +48,9 @@ jobs:
       MEMORY_GB: "12"
       DISPLAY_NAME: "vm-principale"
       WORKFLOW_FILE: "relance-vm-a1.yml"
+      LOOP_MINUTES: "330"    # durée de la boucle avant auto-relance
+      INTERVAL: "90"         # secondes entre deux essais
+      BACKOFF_429: "300"     # pause si Oracle signale trop de requêtes
 
     steps:
       - name: Installer OCI CLI
@@ -71,11 +76,10 @@ jobs:
           region=${REGION}
           key_file=${HOME}/.oci/key.pem
           EOF
-          # Retire l'indentation ajoutée par le YAML
           sed -i 's/^[[:space:]]*//' ~/.oci/config
           chmod 600 ~/.oci/config
 
-      - name: Tentative de création
+      - name: Boucle de tentatives
         id: launch
         env:
           TENANCY: ${{ secrets.OCI_TENANCY }}
@@ -84,68 +88,84 @@ jobs:
         run: |
           set +e
 
-          # 1) La VM existe-t-elle déjà ? (boot volume attaché ou en cours)
-          attached=$(oci compute boot-volume-attachment list \
-            --compartment-id "$TENANCY" \
-            --availability-domain "$AD" \
-            --boot-volume-id "$BOOT_VOLUME_ID" \
-            --query "length(data[?\"lifecycle-state\"=='ATTACHED' || \"lifecycle-state\"=='ATTACHING'])" \
-            --raw-output 2>/dev/null)
-          if [ -n "$attached" ] && [ "$attached" != "0" ]; then
-            echo "Le boot volume est déjà attaché : la VM existe déjà."
-            echo "result=already" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # 2) Paramètres JSON passés par fichier (évite les soucis de guillemets)
+          # Paramètres JSON passés par fichier (évite les soucis de guillemets)
           printf '{"ocpus": %s, "memoryInGBs": %s}' "$OCPUS" "$MEMORY_GB" > shape.json
           printf '{"sourceType": "bootVolume", "bootVolumeId": "%s"}' "$BOOT_VOLUME_ID" > source.json
 
-          # 3) Une seule tentative, sans les réessais internes de la CLI
-          out=$(oci compute instance launch \
-            --compartment-id "$TENANCY" \
-            --availability-domain "$AD" \
-            --shape "VM.Standard.A1.Flex" \
-            --shape-config file://shape.json \
-            --source-details file://source.json \
-            --subnet-id "$SUBNET_ID" \
-            --assign-public-ip false \
-            --display-name "$DISPLAY_NAME" \
-            --no-retry 2>&1)
-          code=$?
+          deadline=$(( $(date +%s) + LOOP_MINUTES * 60 ))
+          attempt=0
+          result="timeout"
 
-          if [ $code -eq 0 ]; then
-            instance_id=$(printf '%s' "$out" | sed -n 's/.*"id": "\(ocid1\.instance[^"]*\)".*/\1/p' | head -n 1)
-            echo "SUCCÈS : instance créée ($instance_id)."
-            echo "result=success" >> "$GITHUB_OUTPUT"
-            echo "instance_id=$instance_id" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            attempt=$((attempt + 1))
+            now=$(date -u +%H:%M:%S)
 
-          # Message d'erreur résumé (sans données sensibles)
-          summary=$(printf '%s' "$out" | grep -E '"(code|message)"' | head -n 2 | tr -s ' ' | tr '\n' ' ')
-          echo "Réponse Oracle : $summary"
+            # 1) La VM existe-t-elle déjà ? (boot volume attaché ou en cours)
+            attached=$(oci compute boot-volume-attachment list \
+              --compartment-id "$TENANCY" \
+              --availability-domain "$AD" \
+              --boot-volume-id "$BOOT_VOLUME_ID" \
+              --query "length(data[?\"lifecycle-state\"=='ATTACHED' || \"lifecycle-state\"=='ATTACHING'])" \
+              --raw-output 2>/dev/null)
+            if [ -n "$attached" ] && [ "$attached" != "0" ]; then
+              echo "[$now] Le boot volume est déjà attaché : la VM existe."
+              result="already"
+              break
+            fi
 
-          if printf '%s' "$out" | grep -qiE 'out of (host )?capacity|TooManyRequests'; then
-            echo "Pas de capacité (ou trop de requêtes). Prochain essai au prochain cron."
-            echo "result=capacity" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+            # 2) Une tentative, sans les réessais internes de la CLI
+            out=$(oci compute instance launch \
+              --compartment-id "$TENANCY" \
+              --availability-domain "$AD" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config file://shape.json \
+              --source-details file://source.json \
+              --subnet-id "$SUBNET_ID" \
+              --assign-public-ip false \
+              --display-name "$DISPLAY_NAME" \
+              --no-retry 2>&1)
+            code=$?
 
-          if printf '%s' "$out" | grep -qiE 'NotAuthenticated|NotAuthorizedOrNotFound|LimitExceeded|InvalidParameter|CannotParseRequest'; then
-            echo "Erreur définitive : arrêt des tentatives."
-            echo "result=fatal" >> "$GITHUB_OUTPUT"
-            {
-              echo "summary<<EOS"
-              echo "$summary"
-              echo "EOS"
-            } >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+            if [ $code -eq 0 ]; then
+              instance_id=$(printf '%s' "$out" | sed -n 's/.*"id": "\(ocid1\.instance[^"]*\)".*/\1/p' | head -n 1)
+              echo "[$now] Essai $attempt : SUCCÈS, instance $instance_id"
+              echo "instance_id=$instance_id" >> "$GITHUB_OUTPUT"
+              result="success"
+              break
+            fi
 
-          # Erreur inconnue, peut-être passagère : le run échoue (e-mail GitHub)
-          echo "Erreur inattendue (sera retentée au prochain cron)."
-          exit 1
+            summary=$(printf '%s' "$out" | grep -E '"(code|message)"' | head -n 2 | tr -s ' ' | tr '\n' ' ')
+
+            if printf '%s' "$out" | grep -qiE 'out of (host )?capacity'; then
+              echo "[$now] Essai $attempt : pas de capacité."
+              sleep "$INTERVAL"
+              continue
+            fi
+
+            if printf '%s' "$out" | grep -qiE 'TooManyRequests'; then
+              echo "[$now] Essai $attempt : trop de requêtes, pause ${BACKOFF_429}s."
+              sleep "$BACKOFF_429"
+              continue
+            fi
+
+            if printf '%s' "$out" | grep -qiE 'NotAuthenticated|NotAuthorizedOrNotFound|LimitExceeded|InvalidParameter|CannotParseRequest'; then
+              echo "[$now] Essai $attempt : erreur définitive : $summary"
+              {
+                echo "summary<<EOS"
+                echo "$summary"
+                echo "EOS"
+              } >> "$GITHUB_OUTPUT"
+              result="fatal"
+              break
+            fi
+
+            # Erreur inconnue (souvent passagère) : on continue après une pause
+            echo "[$now] Essai $attempt : erreur inattendue : $summary"
+            sleep "$INTERVAL"
+          done
+
+          echo "Fin de boucle : résultat = $result après $attempt essai(s)."
+          echo "result=$result" >> "$GITHUB_OUTPUT"
 
       - name: Prévenir (succès)
         if: steps.launch.outputs.result == 'success'
@@ -176,3 +196,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow disable "$WORKFLOW_FILE" --repo "$GITHUB_REPOSITORY"
+
+      - name: Se relancer (pas encore de capacité)
+        if: steps.launch.outputs.result == 'timeout'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run "$WORKFLOW_FILE" --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
